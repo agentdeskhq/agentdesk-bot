@@ -72,6 +72,28 @@ def add_history(sender_id: str, role: str, text: str) -> None:
     del h[:-MAX_HISTORY]
 
 
+# --- Reply cache: identical questions reuse the previous answer, zero API cost ---
+REPLY_CACHE: Dict[str, str] = {}
+MAX_CACHE = 200
+
+
+def normalize(text: str) -> str:
+    t = text.lower().strip()
+    for ch in "?!।.,;:\"'()[]{}":
+        t = t.replace(ch, "")
+    return " ".join(t.split())
+
+
+def get_cached_reply(text: str) -> Optional[str]:
+    return REPLY_CACHE.get(normalize(text))
+
+
+def set_cached_reply(text: str, reply: str) -> None:
+    if len(REPLY_CACHE) >= MAX_CACHE:
+        REPLY_CACHE.pop(next(iter(REPLY_CACHE)))
+    REPLY_CACHE[normalize(text)] = reply
+
+
 def build_system_prompt(cfg: Dict[str, Any], has_history: bool) -> str:
     greeting_rule = (
         "This is an ONGOING conversation: the customer already greeted you earlier, "
@@ -163,11 +185,18 @@ async def send_message(recipient_id: str, text: str) -> None:
 
 async def handle_message(sender_id: str, text: str, cfg: Dict[str, Any]) -> None:
     history = get_history(sender_id)
-    try:
-        reply = await gemini_reply(text, build_system_prompt(cfg, bool(history)), history)
-    except Exception as e:
-        log.warning("gemini failed: %s", e)
-        reply = ""
+    cached = get_cached_reply(text)
+    if cached:
+        log.info("cache hit, chars=%d", len(cached))
+        reply = cached
+    else:
+        try:
+            reply = await gemini_reply(text, build_system_prompt(cfg, bool(history)), history)
+        except Exception as e:
+            log.warning("gemini failed: %s", e)
+            reply = ""
+        if reply:
+            set_cached_reply(text, reply)
     if reply:
         add_history(sender_id, "user", text)
         add_history(sender_id, "model", reply)
