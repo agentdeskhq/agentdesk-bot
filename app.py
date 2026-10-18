@@ -651,16 +651,12 @@ async def handle_message(sender_id: str, text: str, cfg: Dict[str, Any]) -> None
         log.info("escalation started for %s", sender_id)
         return
 
-    # 1. Pre-written FAQ (zero API cost)
-    reply = match_faq(text)
-    source = "faq" if reply else None
+    # SUPER SMART pipeline: AI understands everything.
+    # 1. Similar-question cache (zero API cost, answers were smart to begin with)
+    reply = get_similar_cached(text)
+    source = "similar-cache" if reply else None
 
-    # 2. Similar-question cache (zero API cost)
-    if not reply:
-        reply = get_similar_cached(text)
-        source = "similar-cache" if reply else None
-
-    # 3. AI providers with automatic failover
+    # 2. AI providers with automatic failover (smart intent understanding)
     if not reply:
         try:
             reply = await generate_reply(
