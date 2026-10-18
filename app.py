@@ -41,7 +41,7 @@ OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
 GRAPH_VERSION = os.environ.get("GRAPH_VERSION", "v21.0")
 ADMIN_MESSENGER_ID = os.environ.get("ADMIN_MESSENGER_ID", "")
-PAUSE_SECONDS = int(os.environ.get("HUMAN_TAKEOVER_PAUSE", "60"))  # 60s default; extends on each admin reply
+PAUSE_SECONDS = int(os.environ.get("HUMAN_TAKEOVER_PAUSE", "0"))  # 0 = disabled, bot always replies
 
 app = FastAPI(title="AgentDesk Messenger bot")
 
