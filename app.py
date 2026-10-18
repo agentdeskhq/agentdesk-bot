@@ -8,19 +8,23 @@ All secrets come from environment variables. See .env.example.
 
 import hashlib
 import hmac
+import logging
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
 import yaml
 from fastapi import BackgroundTasks, FastAPI, Header, Request
 from fastapi.responses import PlainTextResponse
 
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("agentdesk")
+
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "")
 APP_SECRET = os.environ.get("APP_SECRET", "")
 PAGE_ACCESS_TOKEN = os.environ.get("PAGE_ACCESS_TOKEN", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
 GRAPH_VERSION = os.environ.get("GRAPH_VERSION", "v21.0")
 
 app = FastAPI(title="AgentDesk Messenger bot")
@@ -43,7 +47,7 @@ DEFAULT_CLIENT: Dict[str, Any] = {
     "business_name": "AgentDesk",
     "language": "bn",
     "products_prices": (
-        "AI agent subscription: ৳1,990/month + ৳3,000 one-time setup; "
+        "AI agent subscription: \u09f31,990/month + \u09f33,000 one-time setup; "
         "7-day free trial."
     ),
     "policies": (
@@ -52,40 +56,74 @@ DEFAULT_CLIENT: Dict[str, Any] = {
     ),
 }
 
+# --- Conversation memory (per sender, in-memory, last few turns) ---
+HISTORY: Dict[str, List[Dict[str, str]]] = {}
+MAX_HISTORY = 12
 
-def build_system_prompt(cfg: Dict[str, Any]) -> str:
+
+def get_history(sender_id: str) -> List[Dict[str, str]]:
+    return HISTORY.get(sender_id, [])
+
+
+def add_history(sender_id: str, role: str, text: str) -> None:
+    h = HISTORY.setdefault(sender_id, [])
+    h.append({"role": role, "text": text})
+    del h[:-MAX_HISTORY]
+
+
+def build_system_prompt(cfg: Dict[str, Any], has_history: bool) -> str:
+    greeting_rule = (
+        "This is an ONGOING conversation: the customer already greeted you earlier, "
+        "so do NOT greet again. No hello/hi/salam, just continue naturally."
+        if has_history
+        else "Greet the customer briefly once (one short greeting), then answer their question."
+    )
     return (
-        f"You are the friendly sales assistant for the business Facebook page "
-        f"\"{cfg.get('business_name', 'AgentDesk')}\".\n"
-        f"Default language: {cfg.get('language', 'bn')} (Bengali first; match the "
-        "customer's language if they write in another).\n"
-        "Keep every reply short and conversational, like a helpful shop assistant "
-        "chatting on Messenger.\n"
-        "Never use em-dashes; use commas or colons instead.\n"
+        f"You are the sharp, friendly sales assistant for the business Facebook page "
+        f"\"{cfg.get('business_name', 'AgentDesk')}\", which sells AI agents to business pages.\n"
+        f"Default language: Bengali. Always match the customer's language.\n"
+        f"{greeting_rule}\n"
+        "Rules:\n"
+        "- Answer the customer's actual question directly and completely. "
+        "Never leave a sentence unfinished, never cut off mid-thought.\n"
+        "- Be genuinely smart: understand what they really want, give specific useful answers, "
+        "no generic filler.\n"
+        "- Keep replies conversational and concise (2-5 sentences), like a sharp shop assistant on Messenger.\n"
+        "- Never use em-dashes; use commas or colons instead.\n"
         f"Products and prices:\n{cfg.get('products_prices', '')}\n"
         f"Policies:\n{cfg.get('policies', '')}\n"
-        "Answer questions, confirm orders, and gently guide interested customers "
-        "to start the free trial."
+        "When they show interest, guide them to message \"DEMO\" to start the free 7-day trial."
     )
 
 
-async def gemini_reply(user_text: str, system_prompt: str) -> str:
+async def gemini_reply(
+    user_text: str, system_prompt: str, history: List[Dict[str, str]]
+) -> str:
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
         f"{GEMINI_MODEL}:generateContent"
     )
+    contents: List[Dict[str, Any]] = [
+        {"role": turn["role"], "parts": [{"text": turn["text"]}]} for turn in history
+    ]
+    contents.append({"role": "user", "parts": [{"text": user_text}]})
     payload = {
         "systemInstruction": {"parts": [{"text": system_prompt}]},
-        "contents": [{"role": "user", "parts": [{"text": user_text}]}],
-        "generationConfig": {"maxOutputTokens": 300, "temperature": 0.7},
+        "contents": contents,
+        "generationConfig": {"maxOutputTokens": 1000, "temperature": 0.7},
     }
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(url, params={"key": GEMINI_API_KEY}, json=payload)
         r.raise_for_status()
         data = r.json()
     try:
-        return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        cand = data["candidates"][0]
+        parts = cand.get("content", {}).get("parts", [])
+        text = "".join(p.get("text", "") for p in parts).strip()
+        log.info("gemini finish=%s chars=%d", cand.get("finishReason"), len(text))
+        return text
     except (KeyError, IndexError, TypeError):
+        log.warning("gemini: unexpected response shape")
         return ""
 
 
@@ -101,14 +139,17 @@ async def send_message(recipient_id: str, text: str) -> None:
 
 
 async def handle_message(sender_id: str, text: str, cfg: Dict[str, Any]) -> None:
-    reply = await gemini_reply(text, build_system_prompt(cfg))
+    history = get_history(sender_id)
+    reply = await gemini_reply(text, build_system_prompt(cfg, bool(history)), history)
     if reply:
+        add_history(sender_id, "user", text)
+        add_history(sender_id, "model", reply)
         await send_message(sender_id, reply)
 
 
-def verify_signature(body: bytes, signature: Optional[str]) -> bool:
+def verify_signature(body: bytes, signature: Optional[str] = None) -> bool:
     if not APP_SECRET:
-        return True  # signature check disabled when no app secret is configured
+        return True
     if not signature or not signature.startswith("sha256="):
         return False
     expected = hmac.new(APP_SECRET.encode(), body, hashlib.sha256).hexdigest()
@@ -150,11 +191,9 @@ async def webhook_receive(
         page_id = str(entry.get("id", ""))
         cfg = CLIENTS.get(page_id, DEFAULT_CLIENT)
         for event in entry.get("messaging", []):
-            # Skip delivery confirmations and read receipts.
             if event.get("delivery") or event.get("read"):
                 continue
             msg = event.get("message") or {}
-            # Skip our own echoed messages to avoid reply loops.
             if msg.get("is_echo"):
                 continue
             sender_id = (event.get("sender") or {}).get("id")
