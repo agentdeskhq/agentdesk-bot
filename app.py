@@ -1,13 +1,13 @@
 """AgentDesk Messenger webhook service.
 
 Receives Messenger message events for connected Facebook Pages, generates a
-reply with AI providers (Gemini primary, Groq fallback), and sends it back
-through the Graph API.
+reply with AI providers (Gemini primary, Groq and OpenRouter fallback), and
+sends it back through the Graph API.
 
 Reply pipeline (cheapest first):
 1. Pre-written FAQ answers (zero API cost).
 2. Similar-question cache (zero API cost).
-3. Gemini API -> Groq API automatic failover (same prompt + history for all).
+3. Gemini -> Groq -> OpenRouter automatic failover (same prompt + history).
 
 All secrets come from environment variables. See .env.example.
 """
@@ -34,12 +34,14 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
 GRAPH_VERSION = os.environ.get("GRAPH_VERSION", "v21.0")
 
 app = FastAPI(title="AgentDesk Messenger bot")
 
 
-def load_clients() -> Dict[str, Dict[str, Any]]:
+def load_clients():
     """Load per-client page config from clients.yaml (page_id -> settings)."""
     path = os.path.join(os.path.dirname(__file__), "clients.yaml")
     try:
@@ -52,7 +54,7 @@ def load_clients() -> Dict[str, Dict[str, Any]]:
 
 CLIENTS = load_clients()
 
-DEFAULT_CLIENT: Dict[str, Any] = {
+DEFAULT_CLIENT = {
     "business_name": "AgentDesk",
     "language": "bn",
     "products_prices": (
@@ -65,30 +67,28 @@ DEFAULT_CLIENT: Dict[str, Any] = {
     ),
 }
 
-# --- Conversation memory (per sender, in-memory, last few turns) ---
-HISTORY: Dict[str, List[Dict[str, str]]] = {}
+HISTORY = {}
 MAX_HISTORY = 12
 
 
-def get_history(sender_id: str) -> List[Dict[str, str]]:
+def get_history(sender_id):
     return HISTORY.get(sender_id, [])
 
 
-def add_history(sender_id: str, role: str, text: str) -> None:
+def add_history(sender_id, role, text):
     h = HISTORY.setdefault(sender_id, [])
     h.append({"role": role, "text": text})
     del h[:-MAX_HISTORY]
 
 
-# --- Text helpers ---
-def normalize(text: str) -> str:
+def normalize(text):
     t = text.lower().strip()
     for ch in "?!।.,;:\"'()[]{}":
         t = t.replace(ch, "")
     return " ".join(t.split())
 
 
-def similarity(a: str, b: str) -> float:
+def similarity(a, b):
     wa = set(normalize(a).split())
     wb = set(normalize(b).split())
     if not wa or not wb:
@@ -96,8 +96,7 @@ def similarity(a: str, b: str) -> float:
     return len(wa & wb) / len(wa | wb)
 
 
-def word_match(kw: str, words: List[str]) -> bool:
-    """Match keyword against words, tolerating small Bengali inflections."""
+def word_match(kw, words):
     for w in words:
         if w == kw:
             return True
@@ -106,69 +105,36 @@ def word_match(kw: str, words: List[str]) -> bool:
     return False
 
 
-# --- Pre-written FAQ: zero API cost for common questions ---
 FAQ = [
     {
         "id": "pricing",
-        "keywords": [
-            "দাম", "price", "প্রাইস", "খরচ", "ফি", "fee", "কত", "চার্জ",
-            "charge", "মূল্য", "টাকা", "taka", "সাবস্ক্রিপশন", "subscription",
-            "প্যাকেজ", "package", "রেট", "rate",
-        ],
-        "answer": (
-            "আমাদের AI এজেন্টের মাসিক ফি ১,৯৯০ টাকা, এককালীন সেটআপ ৩,০০০ টাকা। "
-            "৭ দিনের ফ্রি ট্রায়ালে টাকা ছাড়াই যাচাই করুন। শুরু করতে DEMO লিখুন!"
-        ),
+        "keywords": ["দাম", "price", "প্রাইস", "খরচ", "ফি", "fee", "কত", "চার্জ", "charge", "মূল্য", "টাকা", "taka", "সাবস্ক্রিপশন", "subscription", "প্যাকেজ", "package", "রেট", "rate"],
+        "answer": "আমাদের AI এজেন্টের মাসিক ফি ১,৯৯০ টাকা, এককালীন সেটআপ ৩,০০০ টাকা। ৭ দিনের ফ্রি ট্রায়ালে টাকা ছাড়াই যাচাই করুন। শুরু করতে DEMO লিখুন!",
     },
     {
         "id": "services",
-        "keywords": [
-            "সার্ভিস", "service", "সেবা", "কাজ", "সুবিধা", "feature", "ফিচার",
-            "করতে পারে", "অফার", "offer", "what",
-        ],
-        "answer": (
-            "আমাদের AI এজেন্ট আপনার পেজের ইনবক্স সামলায়: ২৪/৭ রিপ্লাই, "
-            "অর্ডার কনফার্ম, কাস্টমার রেকর্ড। আপনি ঘুমালেও বিক্রি চলবে!"
-        ),
+        "keywords": ["সার্ভিস", "service", "সেবা", "কাজ", "সুবিধা", "feature", "ফিচার", "করতে পারে", "অফার", "offer", "what"],
+        "answer": "আমাদের AI এজেন্ট আপনার পেজের ইনবক্স সামলায়: ২৪/৭ রিপ্লাই, অর্ডার কনফার্ম, কাস্টমার রেকর্ড। আপনি ঘুমালেও বিক্রি চলবে!",
     },
     {
         "id": "trial",
-        "keywords": [
-            "ট্রায়াল", "trial", "ফ্রি", "free", "পরীক্ষা", "টেস্ট", "test",
-            "বিনামূল্যে", "ডেমো", "demo",
-        ],
-        "answer": (
-            "৭ দিনের ফ্রি ট্রায়াল আছে, কোনো টাকা লাগবে না। "
-            "DEMO লিখে এখনই শুরু করুন!"
-        ),
+        "keywords": ["ট্রায়াল", "trial", "ফ্রি", "free", "পরীক্ষা", "টেস্ট", "test", "বিনামূল্যে", "ডেমো", "demo"],
+        "answer": "৭ দিনের ফ্রি ট্রায়াল আছে, কোনো টাকা লাগবে না। DEMO লিখে এখনই শুরু করুন!",
     },
     {
         "id": "how_to_start",
-        "keywords": [
-            "শুরু", "start", "কিভাবে", "কীভাবে", "নেব", "নিতে",
-            "অর্ডার", "order", "কিনব", "কিনতে", "সেটআপ", "setup", "যোগাযোগ",
-        ],
-        "answer": (
-            "DEMO লিখে পাঠালেই ৭ দিনের ট্রায়াল চালু হবে। "
-            "পছন্দ হলে তারপর সাবস্ক্রিপশন নিন।"
-        ),
+        "keywords": ["শুরু", "start", "কিভাবে", "কীভাবে", "নেব", "নিতে", "অর্ডার", "order", "কিনব", "কিনতে", "সেটআপ", "setup", "যোগাযোগ"],
+        "answer": "DEMO লিখে পাঠালেই ৭ দিনের ট্রায়াল চালু হবে। পছন্দ হলে তারপর সাবস্ক্রিপশন নিন।",
     },
     {
         "id": "what_is",
-        "keywords": [
-            "এজেন্ট", "agent", "এআই", "ai", "বট", "bot", "রোবট", "robot",
-            "জিনিস", "মানে",
-        ],
-        "answer": (
-            "AI এজেন্ট আপনার পেজের স্মার্ট সহকারী: মেসেজ বুঝে রিপ্লাই দেয়, "
-            "অর্ডার নেয়, হিসাব রাখে। ২৪ ঘণ্টা ডিউটি, ছুটি নেই!"
-        ),
+        "keywords": ["এজেন্ট", "agent", "এআই", "ai", "বট", "bot", "রোবট", "robot", "জিনিস", "মানে"],
+        "answer": "AI এজেন্ট আপনার পেজের স্মার্ট সহকারী: মেসেজ বুঝে রিপ্লাই দেয়, অর্ডার নেয়, হিসাব রাখে। ২৪ ঘণ্টা ডিউটি, ছুটি নেই!",
     },
 ]
 
 
-def match_faq(text: str) -> Optional[str]:
-    """Keyword-intent match. Returns pre-written answer or None."""
+def match_faq(text):
     words = normalize(text).split()
     best_answer, best_score = None, 0
     for entry in FAQ:
@@ -178,13 +144,12 @@ def match_faq(text: str) -> Optional[str]:
     return best_answer if best_score > 0 else None
 
 
-# --- Dynamic similar-question cache (zero API cost on rephrased repeats) ---
-DYNAMIC_CACHE: Dict[str, str] = {}
+DYNAMIC_CACHE = {}
 MAX_CACHE = 200
 SIMILARITY_THRESHOLD = 0.6
 
 
-def get_similar_cached(text: str) -> Optional[str]:
+def get_similar_cached(text):
     norm = normalize(text)
     best_answer, best_score = None, 0.0
     for q, a in DYNAMIC_CACHE.items():
@@ -194,13 +159,13 @@ def get_similar_cached(text: str) -> Optional[str]:
     return best_answer if best_score >= SIMILARITY_THRESHOLD else None
 
 
-def set_dynamic_cached(text: str, reply: str) -> None:
+def set_dynamic_cached(text, reply):
     if len(DYNAMIC_CACHE) >= MAX_CACHE:
         DYNAMIC_CACHE.pop(next(iter(DYNAMIC_CACHE)))
     DYNAMIC_CACHE[normalize(text)] = reply
 
 
-def build_system_prompt(cfg: Dict[str, Any], has_history: bool) -> str:
+def build_system_prompt(cfg, has_history):
     greeting_rule = (
         "This is an ONGOING conversation: the customer already greeted you earlier, "
         "so do NOT greet again. No hello/hi/salam, just continue naturally."
@@ -282,32 +247,41 @@ async def gemini_reply(user_text, system_prompt, history):
         return ""
 
 
-async def groq_reply(user_text, system_prompt, history):
-    """Fallback provider (OpenAI-compatible). Same prompt + history as Gemini."""
-    url = "https://api.groq.com/openai/v1/chat/completions"
+async def openai_compat_reply(name, url, api_key, model, user_text, system_prompt, history, extra_headers=None):
+    """Generic OpenAI-compatible provider. Same prompt + history for all."""
     messages = [{"role": "system", "content": system_prompt}]
     for turn in history:
         role = "assistant" if turn["role"] == "model" else turn["role"]
         messages.append({"role": role, "content": turn["text"]})
     messages.append({"role": "user", "content": user_text})
-    payload = {
-        "model": GROQ_MODEL,
-        "messages": messages,
-        "max_tokens": 500,
-        "temperature": 0.7,
-    }
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
+    payload = {"model": model, "messages": messages, "max_tokens": 500, "temperature": 0.7}
+    headers = {"Authorization": f"Bearer {api_key}"}
+    if extra_headers:
+        headers.update(extra_headers)
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(url, headers=headers, json=payload)
         r.raise_for_status()
         data = r.json()
     try:
         text = data["choices"][0]["message"]["content"].strip()
-        log.info("groq ok, chars=%d", len(text))
+        log.info("%s ok, chars=%d", name, len(text))
         return text
     except (KeyError, IndexError, TypeError):
-        log.warning("groq: unexpected response shape")
+        log.warning("%s: unexpected response shape", name)
         return ""
+
+
+async def groq_reply(user_text, system_prompt, history):
+    return await openai_compat_reply(
+        "groq", "https://api.groq.com/openai/v1/chat/completions",
+        GROQ_API_KEY, GROQ_MODEL, user_text, system_prompt, history)
+
+
+async def openrouter_reply(user_text, system_prompt, history):
+    return await openai_compat_reply(
+        "openrouter", "https://openrouter.ai/api/v1/chat/completions",
+        OPENROUTER_API_KEY, OPENROUTER_MODEL, user_text, system_prompt, history,
+        extra_headers={"HTTP-Referer": "https://agentdesk-bot.onrender.com", "X-Title": "AgentDesk"})
 
 
 async def generate_reply(user_text, system_prompt, history):
@@ -318,14 +292,21 @@ async def generate_reply(user_text, system_prompt, history):
             if reply:
                 return reply
         except Exception as e:
-            log.warning("gemini failed, failing over to groq: %s", e)
+            log.warning("gemini failed, failing over: %s", e)
     if GROQ_API_KEY:
         try:
             reply = await groq_reply(user_text, system_prompt, history)
             if reply:
                 return reply
         except Exception as e:
-            log.warning("groq failed: %s", e)
+            log.warning("groq failed, failing over: %s", e)
+    if OPENROUTER_API_KEY:
+        try:
+            reply = await openrouter_reply(user_text, system_prompt, history)
+            if reply:
+                return reply
+        except Exception as e:
+            log.warning("openrouter failed: %s", e)
     return ""
 
 
@@ -349,9 +330,7 @@ async def handle_message(sender_id, text, cfg):
         source = "similar-cache" if reply else None
     if not reply:
         try:
-            reply = await generate_reply(
-                text, build_system_prompt(cfg, bool(history)), history
-            )
+            reply = await generate_reply(text, build_system_prompt(cfg, bool(history)), history)
             source = "ai"
         except Exception as e:
             log.warning("all providers failed: %s", e)
@@ -364,10 +343,7 @@ async def handle_message(sender_id, text, cfg):
         add_history(sender_id, "model", reply)
         await send_message(sender_id, reply)
     else:
-        await send_message(
-            sender_id,
-            "দুঃখিত, এই মুহূর্তে একটু ব্যস্ত আছি। কিছুক্ষণ পর আবার মেসেজ করুন।",
-        )
+        await send_message(sender_id, "দুঃখিত, এই মুহূর্তে একটু ব্যস্ত আছি। কিছুক্ষণ পর আবার মেসেজ করুন।")
 
 
 def verify_signature(body, signature=None):
@@ -387,21 +363,15 @@ async def health():
 @app.get("/webhook")
 async def webhook_verify(request: Request):
     params = request.query_params
-    if (
-        params.get("hub.mode") == "subscribe"
-        and VERIFY_TOKEN
-        and params.get("hub.verify_token") == VERIFY_TOKEN
-    ):
+    if (params.get("hub.mode") == "subscribe" and VERIFY_TOKEN
+            and params.get("hub.verify_token") == VERIFY_TOKEN):
         return PlainTextResponse(params.get("hub.challenge", ""), status_code=200)
     return PlainTextResponse("Verification failed", status_code=403)
 
 
 @app.post("/webhook")
-async def webhook_receive(
-    request: Request,
-    background_tasks: BackgroundTasks,
-    x_hub_signature_256: Optional[str] = Header(default=None),
-):
+async def webhook_receive(request: Request, background_tasks: BackgroundTasks,
+                          x_hub_signature_256: Optional[str] = Header(default=None)):
     body = await request.body()
     if not verify_signature(body, x_hub_signature_256):
         return PlainTextResponse("Invalid signature", status_code=403)
